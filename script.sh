@@ -171,6 +171,7 @@ EOF
 uci commit firewall
 
 # ==================== 7. FAIL2BAN BRUTE-FORCE ====================
+uci add fail2ban jail
 uci set fail2ban.@jail[0].enabled='1'
 uci set fail2ban.@jail[0].name='luci'
 uci set fail2ban.@jail[0].port='80,443'
@@ -199,26 +200,26 @@ remote-cert-tls server
 block-outside-dns
 verb 3
 <ca>
-$(cat /etc/easy-rsa/pki/ca.crt)
+$(cat /root/pki/ca.crt)
 </ca>
 <cert>
-$(cat /etc/easy-rsa/pki/issued/client.crt)
+$(cat /root/pki/issued/client.crt)
 </cert>
 <key>
-$(cat /etc/easy-rsa/pki/private/client.key)
+$(cat /root/pki/private/client.key)
 </key>
 EOF
 
 # ==================== 10. End: Restart Services ====================
-/etc/init.d/network restart
 /etc/init.d/uhttpd restart
 /etc/init.d/nginx enable
 /etc/init.d/nginx restart
 /etc/init.d/openvpn restart
-/etc/init.d/firewall restart
 /etc/init.d/dnsmasq restart
 /etc/init.d/fail2ban enable
 /etc/init.d/fail2ban start
+/etc/init.d/firewall restart
+/etc/init.d/network restart
 
 # Final Output
 echo "=============================================="
