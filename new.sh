@@ -81,6 +81,7 @@ opkg update
 opkg install luci luci-ssl uhttpd luci-app-openvpn \
     openvpn-openssl openvpn-easy-rsa openssl-util \
     ip-full iptables-nft kmod-nft-nat kmod-tun \
+    vpn-policy-routing luci-app-vpn-policy-routing \
     curl ca-certificates || true
 
 # ==================== 2. NETWORK INTERFACES ====================
