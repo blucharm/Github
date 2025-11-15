@@ -71,7 +71,7 @@ mkdir -p /etc/easy-rsa
 cd /etc/easy-rsa
 
 if [ ! -f /etc/easy-rsa/pki/ca.crt ]; then
-    echo "yes" | easyrsa init-pki
+    easyrsa init-pki
     EASYRSA_BATCH=1 easyrsa build-ca nopass
     easyrsa gen-dh
     EASYRSA_BATCH=1 easyrsa build-server-full server nopass
