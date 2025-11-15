@@ -1,6 +1,9 @@
 #!/bin/sh
 # =============================================================================
-# OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4
+# OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4 (AUTO-FIX WAN MAPPING + NFT RULES)
+# - Auto-detect WAN interface from routing table and ensure UCI network.wan.device
+# - Clean/replace /etc/firewall.user with idempotent rules using detected WAN iface
+# - Add nft/iptables NAT & forwarding rules for VPN subnet
 # =============================================================================
 
 set -e
@@ -15,12 +18,9 @@ echo ""
 VPS_IP=$(ip -4 addr show | awk '/inet/ {print $2}' | cut -d'/' -f1 | \
          grep -vE '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)' | head -n1 || true)
 
-# fallback to any non-loopback IPv4 if above returned empty
 if [ -z "$VPS_IP" ]; then
     VPS_IP=$(ip -4 addr show | awk '/inet/ {print $2}' | cut -d'/' -f1 | grep -v '^127\.' | head -n1 || true)
 fi
-
-# Trim CR/LF and spaces just in case
 VPS_IP=$(echo "$VPS_IP" | tr -d '\r' | awk '{print $1}')
 
 if [ -z "$VPS_IP" ]; then
@@ -28,15 +28,16 @@ if [ -z "$VPS_IP" ]; then
     echo "   Will try UCI 'network.wan' fallback when creating client config."
 fi
 
-# Detect gateway
+# Detect gateway and active interface
 VPS_GATEWAY=$(ip route | awk '/default/ {print $3; exit}' || true)
-
-# Detect active interface used for outbound
 ACTIVE_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk -F"dev " '{ if (NF>1) print $2 }' | awk '{print $1; exit}' || true)
 if [ -z "$ACTIVE_IFACE" ]; then
     ACTIVE_IFACE=$(ip -o -4 addr show | awk '{print $2}' | grep -v lo | head -n1 || true)
 fi
 
+# Determine WAN_IF from default route (this is authoritative)
+WAN_IF=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
+WAN_IF=${WAN_IF:-$ACTIVE_IFACE}
 # Determine a LAN bridge iface fallback (if present)
 if ip link show br-lan >/dev/null 2>&1; then
     BR_IFACE="br-lan"
@@ -44,7 +45,19 @@ else
     BR_IFACE="$ACTIVE_IFACE"
 fi
 
-# OpenVPN config
+# Ensure UCI network.wan.device points to actual WAN_IF (so fw4 regenerates rules correctly)
+CURRENT_WAN_DEVICE=$(uci get network.wan.device 2>/dev/null || true)
+if [ "$CURRENT_WAN_DEVICE" != "$WAN_IF" ]; then
+    echo "⚙ Updating network.wan.device from '$CURRENT_WAN_DEVICE' -> '$WAN_IF'"
+    # Use delete then set to ensure no conflicting option device/ifname entries remain
+    uci delete network.wan.device 2>/dev/null || true
+    uci set network.wan.device="$WAN_IF"
+    uci commit network
+    /etc/init.d/network reload || true
+    # firewall will be restarted later after config updates
+fi
+
+# OpenVPN config defaults
 OVPN_SERVER_PORT="1194"
 OVPN_SERVER_SUBNET="10.9.0.0"
 DNS_UPSTREAM="${DNS_UPSTREAM:-1.1.1.1}"
@@ -53,6 +66,7 @@ echo "📊 Configuration:"
 echo "   VPS IP:       ${VPS_IP:-<not-detected>}"
 echo "   Gateway:      $VPS_GATEWAY"
 echo "   Interface:    $ACTIVE_IFACE"
+echo "   WAN_IF:       $WAN_IF"
 echo "   Bridge iface: $BR_IFACE"
 echo "   VPN Subnet:   $OVPN_SERVER_SUBNET/24"
 echo "   VPN Port:     $OVPN_SERVER_PORT"
@@ -60,11 +74,10 @@ echo "   DNS:          $DNS_UPSTREAM"
 echo ""
 read -p "Press ENTER to continue or Ctrl+C to abort..."
 
-# ==================== 1. INSTALL PACKAGES (OpenWrt 24.10.4 recommended) ====================
+# ==================== 1. INSTALL PACKAGES ====================
 echo ""
 echo "==> [1/10] Installing recommended packages for OpenWrt 24.10.4..."
 opkg update
-# Recommended packages: openvpn-openssl, openvpn-easy-rsa (or easy-rsa), uhttpd, luci, luci-app-openvpn, nft/iptables modules
 opkg install luci luci-ssl uhttpd luci-app-openvpn \
     openvpn-openssl openvpn-easy-rsa openssl-util \
     ip-full iptables-nft kmod-nft-nat kmod-tun \
@@ -84,7 +97,6 @@ echo "==> [3/10] Setting up PKI..."
 mkdir -p /etc/easy-rsa
 cd /etc/easy-rsa
 
-# Try to find easyrsa binary (packages differ; openvpn-easy-rsa provides easyrsa)
 EASYRSA_CMD="$(command -v easyrsa || true)"
 if [ -z "$EASYRSA_CMD" ] && [ -x /usr/share/easy-rsa/easyrsa ]; then
     EASYRSA_CMD="/usr/share/easy-rsa/easyrsa"
@@ -151,7 +163,6 @@ mute 10
 explicit-exit-notify 1
 EOF
 
-# UCI config
 uci delete openvpn.server 2>/dev/null || true
 uci set openvpn.server=openvpn
 uci set openvpn.server.enabled='1'
@@ -181,192 +192,82 @@ uci set uhttpd.main.no_ipv6='1' 2>/dev/null || true
 uci delete uhttpd.main.redirect_https 2>/dev/null || true
 uci commit uhttpd
 
-# ==================== 7. FIREWALL CONFIG ====================
+# ==================== 7. FIREWALL CONFIG (UCI) ====================
 echo "==> [7/10] Configuring firewall..."
 cp /etc/config/firewall /etc/config/firewall.backup 2>/dev/null || true
-WAN_EXISTS=$(uci show firewall 2>/dev/null | grep -c "zone.*wan" || echo "0")
 
-if [ "$WAN_EXISTS" -eq 0 ]; then
-    cat > /etc/config/firewall <<EOF
-config defaults
-	option input 'ACCEPT'
-	option output 'ACCEPT'
-	option forward 'REJECT'
-	option synflood_protect '1'
-
-config zone
-	option name 'lan'
-	option input 'ACCEPT'
-	option output 'ACCEPT'
-	option forward 'ACCEPT'
-	option masq '1'
-	list network 'lan'
-
-config zone
-	option name 'vpnserver'
-	option input 'ACCEPT'
-	option output 'ACCEPT'
-	option forward 'ACCEPT'
-	option masq '1'
-	list network 'vpnserver'
-
-config forwarding
-	option src 'vpnserver'
-	option dest 'lan'
-
-config rule
-	option name 'Allow-SSH'
-	option src 'lan'
-	option proto 'tcp'
-	option dest_port '22'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-HTTP'
-	option src 'lan'
-	option proto 'tcp'
-	option dest_port '80'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-HTTPS'
-	option src 'lan'
-	option proto 'tcp'
-	option dest_port '443'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-OpenVPN'
-	option src 'lan'
-	option proto 'udp'
-	option dest_port '$OVPN_SERVER_PORT'
-	option target 'ACCEPT'
-EOF
-else
-    cat > /etc/config/firewall <<EOF
-config defaults
-	option input 'REJECT'
-	option output 'ACCEPT'
-	option forward 'REJECT'
-	option synflood_protect '1'
-
-config zone
-	option name 'wan'
-	option input 'REJECT'
-	option output 'ACCEPT'
-	option forward 'REJECT'
-	option masq '1'
-	option mtu_fix '1'
-	list network 'wan'
-
-config zone
-	option name 'lan'
-	option input 'ACCEPT'
-	option output 'ACCEPT'
-	option forward 'ACCEPT'
-	list network 'lan'
-
-config zone
-	option name 'vpnserver'
-	option input 'ACCEPT'
-	option output 'ACCEPT'
-	option forward 'ACCEPT'
-	option masq '1'
-	list network 'vpnserver'
-
-config forwarding
-	option src 'lan'
-	option dest 'wan'
-
-config forwarding
-	option src 'vpnserver'
-	option dest 'wan'
-
-config rule
-	option name 'Allow-SSH'
-	option src 'wan'
-	option proto 'tcp'
-	option dest_port '22'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-HTTP'
-	option src 'wan'
-	option proto 'tcp'
-	option dest_port '80'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-HTTPS'
-	option src 'wan'
-	option proto 'tcp'
-	option dest_port '443'
-	option target 'ACCEPT'
-
-config rule
-	option name 'Allow-OpenVPN'
-	option src 'wan'
-	option proto 'udp'
-	option dest_port '$OVPN_SERVER_PORT'
-	option target 'ACCEPT'
-EOF
+# Ensure vpnserver zone exists and forwards to wan
+if ! uci show firewall.@zone 2>/dev/null | grep -q "vpnserver"; then
+    uci add firewall zone
+    uci set firewall.@zone[-1].name='vpnserver'
+    uci set firewall.@zone[-1].input='ACCEPT'
+    uci set firewall.@zone[-1].output='ACCEPT'
+    uci set firewall.@zone[-1].forward='REJECT'
+    uci add_list firewall.@zone[-1].network='vpnserver'
+    uci set firewall.@zone[-1].masq='1'
 fi
 
-# ==================== 8. CUSTOM FIREWALL RULES ====================
+# Ensure forwarding vpnserver -> wan exists
+if ! uci show firewall.@forwarding 2>/dev/null | grep -q "src='vpnserver'"; then
+    uci add firewall forwarding
+    uci set firewall.@forwarding[-1].src='vpnserver'
+    uci set firewall.@forwarding[-1].dest='wan'
+fi
+
+uci commit firewall
+
+# ==================== 8. CUSTOM FIREWALL RULES (clean, idempotent) ====================
 echo "==> [8/10] Creating custom firewall rules..."
-cat > /etc/firewall.user <<FWUSER
+cat > /etc/firewall.user <<'FWUSER'
 #!/bin/sh
+# Custom firewall rules - runs after fw4 initialization
 sleep 3
 
-# Use nft if available
+# Detect WAN interface from routing table
+WAN_IF="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"
+WAN_IF="${WAN_IF:-br-lan}"
+TUN_IF="tun1"
+OVPN_NET="10.9.0.0/24"
+
+# Use nft if available (preferred)
 if command -v nft >/dev/null 2>&1; then
     nft add table inet fw4 2>/dev/null || true
     nft add chain inet fw4 srcnat { type nat hook postrouting priority 100 \; } 2>/dev/null || true
     nft add chain inet fw4 forward_vpnserver { type filter hook forward priority 0 \; } 2>/dev/null || true
 
-    nft add rule inet fw4 srcnat oifname "$BR_IFACE" ip saddr $OVPN_SERVER_SUBNET/24 counter masquerade 2>/dev/null || true
-    nft add rule inet fw4 srcnat oifname "$ACTIVE_IFACE" ip saddr $OVPN_SERVER_SUBNET/24 counter masquerade 2>/dev/null || true
+    # NAT for VPN clients (idempotent: add rule, ignore errors)
+    nft add rule inet fw4 srcnat oifname "$WAN_IF" ip saddr $OVPN_NET counter masquerade 2>/dev/null || true
 
-    nft add rule inet fw4 forward_vpnserver oifname "$BR_IFACE" counter accept 2>/dev/null || true
-    nft add rule inet fw4 forward_vpnserver oifname "$ACTIVE_IFACE" counter accept 2>/dev/null || true
+    # Forwarding accept for VPN <-> WAN
+    nft add rule inet fw4 forward_vpnserver iifname "$TUN_IF" oifname "$WAN_IF" counter accept 2>/dev/null || true
+    nft add rule inet fw4 forward_vpnserver iifname "$WAN_IF" oifname "$TUN_IF" ct state related,established counter accept 2>/dev/null || true
 fi
 
-# iptables fallback NAT
+# iptables fallback
 if ! command -v nft >/dev/null 2>&1; then
-    iptables -t nat -C POSTROUTING -s $OVPN_SERVER_SUBNET/24 -o "$BR_IFACE" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s $OVPN_SERVER_SUBNET/24 -o "$BR_IFACE" -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -C POSTROUTING -s $OVPN_NET -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s $OVPN_NET -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
 
-    iptables -t nat -C POSTROUTING -s $OVPN_SERVER_SUBNET/24 -o "$ACTIVE_IFACE" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s $OVPN_SERVER_SUBNET/24 -o "$ACTIVE_IFACE" -j MASQUERADE 2>/dev/null || true
+    iptables -C FORWARD -i "$TUN_IF" -o "$WAN_IF" -s $OVPN_NET -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$TUN_IF" -o "$WAN_IF" -s $OVPN_NET -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
+
+    iptables -C FORWARD -i "$WAN_IF" -o "$TUN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$WAN_IF" -o "$TUN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 fi
 
-# TTL spoofing (be careful, only add if you need it)
-iptables -t mangle -C POSTROUTING -o "$ACTIVE_IFACE" -j TTL --ttl-set 128 2>/dev/null || \
-iptables -t mangle -A POSTROUTING -o "$ACTIVE_IFACE" -j TTL --ttl-set 128 2>/dev/null || true
-
-iptables -t mangle -C POSTROUTING -o "$BR_IFACE" -j TTL --ttl-set 128 2>/dev/null || \
-iptables -t mangle -A POSTROUTING -o "$BR_IFACE" -j TTL --ttl-set 128 2>/dev/null || true
-
-iptables -t mangle -C POSTROUTING -o tun1 -j TTL --ttl-set 128 2>/dev/null || \
-iptables -t mangle -A POSTROUTING -o tun1 -j TTL --ttl-set 128 2>/dev/null || true
-
-# TCP MSS clamp
-iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460 2>/dev/null || \
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460 2>/dev/null || true
-
-# DNS leak protection -- allow only to resolver 10.9.0.1
-iptables -C FORWARD -p tcp --dport 53 -j REJECT 2>/dev/null || iptables -I FORWARD -p tcp --dport 53 -j REJECT 2>/dev/null || true
-iptables -C FORWARD -p udp --dport 53 -j REJECT 2>/dev/null || iptables -I FORWARD -p udp --dport 53 -j REJECT 2>/dev/null || true
-
-iptables -C FORWARD -s $OVPN_SERVER_SUBNET/24 -d 10.9.0.1 -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
-iptables -I FORWARD -s $OVPN_SERVER_SUBNET/24 -d 10.9.0.1 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-iptables -C FORWARD -s $OVPN_SERVER_SUBNET/24 -d 10.9.0.1 -p udp --dport 53 -j ACCEPT 2>/dev/null || \
-iptables -I FORWARD -s $OVPN_SERVER_SUBNET/24 -d 10.9.0.1 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+# Optional: TCP MSS clamp
+if command -v iptables >/dev/null 2>&1; then
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460 2>/dev/null || \
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460 2>/dev/null || true
+fi
 
 logger "OpenVPN custom firewall rules applied"
 FWUSER
 
 chmod +x /etc/firewall.user
+
+# Restart firewall so fw4 regenerates using updated network.wan.device
+/etc/init.d/firewall restart || true
 
 # ==================== 9. DNS CONFIG ====================
 echo "==> [9/10] Configuring DNS..."
@@ -422,31 +323,25 @@ if [ "$BBR_AVAILABLE" = "yes" ]; then
 fi
 sysctl -p 2>&1 | grep -v "No such file or directory" || true
 
-# ==================== 11. GENERATE CLIENT CONFIG (FIXED remote line) ====================
+# ==================== 11. GENERATE CLIENT CONFIG (remote line fixed) ====================
 echo "==> Generating client config..."
-
-# If VPS_IP empty, try to get it from UCI network.wan (if available)
+# Fallback VPS_IP from UCI if undetected
 if [ -z "$VPS_IP" ]; then
-    # try common uci path (may vary). This is a best-effort fallback.
     WAN_IP="$(uci get network.wan.ipaddr 2>/dev/null || true)"
     if [ -n "$WAN_IP" ]; then
         VPS_IP="$WAN_IP"
         echo "Using fallback VPS IP from UCI: $VPS_IP"
     fi
 fi
-
-# final guard: ensure values trimmed
 VPS_IP=$(echo "$VPS_IP" | tr -d '\r' | awk '{print $1}')
 OVPN_SERVER_PORT=$(echo "$OVPN_SERVER_PORT" | tr -d '\r' | awk '{print $1}')
 
-# check certificates/keys exist before writing inline .ovpn
 if [ -f /etc/easy-rsa/pki/ca.crt ] && [ -f /etc/easy-rsa/pki/issued/client1.crt ] && [ -f /etc/easy-rsa/pki/private/client1.key ] && [ -f /etc/easy-rsa/pki/ta.key ]; then
     cat > /root/client1.ovpn <<EOF
 # OpenVPN Client Config for Windows
 client
 dev tun
 proto udp
-# remote line uses explicit variable expansion and fallbacks
 remote ${VPS_IP:-127.0.0.1} ${OVPN_SERVER_PORT:-1194}
 resolv-retry infinite
 nobind
@@ -482,13 +377,11 @@ $(cat /etc/easy-rsa/pki/private/client1.key)
 $(cat /etc/easy-rsa/pki/ta.key)
 </tls-auth>
 EOF
-
     chmod 600 /root/client1.ovpn
     echo "✓ /root/client1.ovpn generated. Check 'remote' entry:"
     grep -n '^remote ' /root/client1.ovpn || true
 else
     echo "⚠ Client certificate/key files missing, skipping /root/client1.ovpn generation."
-    echo "   Ensure /etc/easy-rsa/pki/ca.crt, issued/client1.crt, private/client1.key and ta.key exist."
 fi
 
 # ==================== 12. START SERVICES ====================
@@ -505,17 +398,29 @@ if [ -x /etc/firewall.user ]; then
     /etc/firewall.user || true
 fi
 
-# ==================== 13. VERIFICATION (brief) ====================
+sleep 2
+
+# ==================== 13. VERIFICATION ====================
 echo ""
-echo "==> Verifying critical items..."
-/etc/init.d/openvpn status >/dev/null 2>&1 && echo "  ✓ OpenVPN status ok" || echo "  ⚠ OpenVPN status check failed/unknown"
-if [ -f /root/client1.ovpn ]; then
-    echo "  ✓ client file present: /root/client1.ovpn"
-    echo "  -> remote line:"
-    grep '^remote ' /root/client1.ovpn || true
-else
-    echo "  ✗ client file not present"
+echo "==> Verifying setup..."
+/etc/init.d/openvpn status >/dev/null 2>&1 && echo "  ✓ OpenVPN running" || echo "  ✗ OpenVPN failed"
+/etc/init.d/uhttpd status >/dev/null 2>&1 && echo "  ✓ uhttpd running" || echo "  ✗ uhttpd failed"
+ip addr show tun1 >/dev/null 2>&1 && echo "  ✓ tun1 interface UP" || echo "  ✗ tun1 interface DOWN"
+
+# Check nft NAT rules presence
+RULES_COUNT=0
+if command -v nft >/dev/null 2>&1; then
+    RULES_COUNT=$(nft list chain inet fw4 srcnat 2>/dev/null | grep -c "$OVPN_SERVER_SUBNET" || echo "0")
 fi
 
+if [ "$RULES_COUNT" -ge 1 ]; then
+    echo "  ✓ Firewall NAT rules applied ($RULES_COUNT rules)"
+else
+    echo "  ⚠ Firewall NAT rules not found in srcnat -- check /etc/firewall.user and nft list ruleset"
+fi
+
+# Final summary
 echo ""
-echo "Done."
+echo "Setup finished at $(date). Please test VPN client internet access. If client still has no internet,"
+echo "run: nft list ruleset | sed -n '1,240p'  and paste output here for further analysis."
+echo ""
