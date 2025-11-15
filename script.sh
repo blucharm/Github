@@ -24,7 +24,7 @@ opkg install --force-overwrite \
     iptables-nft nftables nftables-json \
     iptables-mod-ipopt iptables-mod-nat-extra \
     openvpn-openssl luci-app-openvpn \
-    nginx-ssl openssl-util easy-rsa \
+    nginx-ssl openssl-util openvpn-easy-rsa \
     fail2ban kmod-tun \
     curl ca-certificates
 
