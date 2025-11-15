@@ -22,7 +22,7 @@ opkg install --force-overwrite \
     luci luci-ssl luci-compat \
     ip-full ipset \
     iptables-nft nftables nftables-json \
-    iptables-mod-ttl iptables-mod-ipopt iptables-mod-nat-extra \
+    iptables-mod-ipopt iptables-mod-nat-extra \
     openvpn-openssl luci-app-openvpn \
     nginx-ssl openssl-util \
     fail2ban kmod-tun \
