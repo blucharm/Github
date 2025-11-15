@@ -343,30 +343,22 @@ fi
 # ==================== 7. CUSTOM FIREWALL RULES (FW4 COMPATIBLE) ====================
 echo "==> [7/9] Creating custom firewall rules..."
 
-# Create nftables script for fw4
-cat > /etc/nftables.d/99-custom-openvpn.nft <<'NFTSCRIPT'
-#!/usr/sbin/nft -f
-
-# Custom OpenVPN rules for fw4
-
-# Add NAT for VPN clients
-add rule inet fw4 srcnat oifname "br-lan" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT br-lan"
-add rule inet fw4 srcnat oifname "eth0" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT eth0"
-
-# Add forwarding rules
-add rule inet fw4 forward_vpnserver oifname "br-lan" counter accept comment "OpenVPN forward to br-lan"
-add rule inet fw4 forward_vpnserver oifname "eth0" counter accept comment "OpenVPN forward to eth0"
-NFTSCRIPT
-
-chmod +x /etc/nftables.d/99-custom-openvpn.nft
-
-# Create firewall.user for iptables rules (TTL spoofing)
+# Create firewall.user for all custom rules (iptables + nftables)
 cat > /etc/firewall.user <<'FWUSER'
 #!/bin/sh
 # Custom firewall rules - runs after fw4 initialization
 
 # Wait for fw4 to fully initialize
 sleep 3
+
+# ==================== NFTABLES NAT RULES ====================
+# Add NAT for VPN clients using nft command (not .nft file)
+nft add rule inet fw4 srcnat oifname "br-lan" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT br-lan" 2>/dev/null || true
+nft add rule inet fw4 srcnat oifname "eth0" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT eth0" 2>/dev/null || true
+
+# Add forwarding rules
+nft add rule inet fw4 forward_vpnserver oifname "br-lan" counter accept comment "OpenVPN forward to br-lan" 2>/dev/null || true
+nft add rule inet fw4 forward_vpnserver oifname "eth0" counter accept comment "OpenVPN forward to eth0" 2>/dev/null || true
 
 # ==================== TTL SPOOFING (Windows = 128) ====================
 iptables -t mangle -F POSTROUTING 2>/dev/null || true
@@ -382,11 +374,6 @@ iptables -I FORWARD -p tcp --dport 53 -j REJECT 2>/dev/null || true
 iptables -I FORWARD -p udp --dport 53 -j REJECT 2>/dev/null || true
 iptables -I FORWARD -s 10.9.0.0/24 -d 10.9.0.1 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -s 10.9.0.0/24 -d 10.9.0.1 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-
-# Apply nftables custom rules
-if [ -f /etc/nftables.d/99-custom-openvpn.nft ]; then
-    nft -f /etc/nftables.d/99-custom-openvpn.nft 2>/dev/null || true
-fi
 
 logger "OpenVPN custom firewall rules applied"
 FWUSER
@@ -543,9 +530,20 @@ RULES_COUNT=$(nft list chain inet fw4 srcnat 2>/dev/null | grep -c "10.9.0.0" ||
 if [ "$RULES_COUNT" -ge 1 ]; then
     echo "  ✓ Firewall NAT rules applied ($RULES_COUNT rules)"
 else
-    echo "  ✗ Firewall NAT rules missing (will retry)"
-    # Retry applying nftables rules
-    nft -f /etc/nftables.d/99-custom-openvpn.nft 2>/dev/null && echo "  ✓ NAT rules applied on retry" || echo "  ✗ NAT rules failed"
+    echo "  ⚠ Firewall NAT rules missing, applying now..."
+    # Apply nftables rules directly
+    nft add rule inet fw4 srcnat oifname "br-lan" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT br-lan" 2>/dev/null || true
+    nft add rule inet fw4 srcnat oifname "eth0" ip saddr 10.9.0.0/24 counter masquerade comment "OpenVPN NAT eth0" 2>/dev/null || true
+    nft add rule inet fw4 forward_vpnserver oifname "br-lan" counter accept comment "OpenVPN forward to br-lan" 2>/dev/null || true
+    nft add rule inet fw4 forward_vpnserver oifname "eth0" counter accept comment "OpenVPN forward to eth0" 2>/dev/null || true
+    
+    # Verify again
+    RULES_COUNT=$(nft list chain inet fw4 srcnat 2>/dev/null | grep -c "10.9.0.0" || echo "0")
+    if [ "$RULES_COUNT" -ge 1 ]; then
+        echo "  ✓ NAT rules applied successfully"
+    else
+        echo "  ✗ NAT rules failed - check manually with: nft list ruleset"
+    fi
 fi
 
 # Check Nginx can reach uhttpd
