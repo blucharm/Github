@@ -1,234 +1,232 @@
 #!/bin/sh
 # =============================================================================
-# OPENWRT VPS: FULL SETUP - NO PUBLIC DNS, WIREGUARD SERVER, OPENVPN CLIENT
-# Automated network configuration (Static WAN) -> package install -> VPN setup.
-# Features: Single Host DNS, TTL Spoofing (Windows 128), DNS Leak Protection.
-# Author: Gemini | Date: November 15, 2025
+# OPENVPN FULL SETUP (REVISED)
+# - Configures OpenVPN Server, Nginx Proxy, TTL Spoofing, DNS Leak Fix
+# - Assumes WAN Static IP is configured from PART 1.
 # =============================================================================
 
-echo "Starting FULL OpenWrt VPS Setup..."
+set -e
 
-# ==================== 3. INSTALL PACKAGES ====================
+# ==================== USER CONFIGURATION (DO NOT CHANGE IF SET IN PART 1) ====================
+VPS_IP="45.63.92.69"
+VPS_NETMASK="255.255.254.0"
+DNS_UPSTREAM="108.61.10.10"
+NIC_WAN="eth0"
+# ===========================================================================================
+
+echo "Starting full setup for VPS $VPS_IP..."
+
+# ==================== 1. INSTALL PACKAGES ====================
 opkg update
 opkg install --force-overwrite \
-    nano \
-    luci luci-ssl luci-compat luci-app-wireguard luci-app-openvpn \
-    wireguard-tools kmod-wireguard \
-    openvpn-openssl \
-    nftables iptables iptables-nft \
+    luci luci-ssl luci-compat \
+    ip-full ipset \
+    iptables-nft nftables nftables-json \
     iptables-mod-ttl iptables-mod-ipopt iptables-mod-nat-extra \
+    openvpn-openssl luci-app-openvpn \
     nginx-ssl openssl-util \
-    fail2ban \
-    curl ca-certificates \
-    dnsmasq-full
+    fail2ban kmod-tun \
+    curl ca-certificates
 
-# ==================== 4. GENERATE WIREGUARD KEYS & CONFIG ====================
-WG_SERVER_KEY=$(wg genkey)
-WG_SERVER_PUB=$(echo "$WG_SERVER_KEY" | wg pubkey)
-WG_CLIENT_KEY=$(wg genkey)
-WG_CLIENT_PUB=$(echo "$WG_CLIENT_KEY" | wg pubkey)
-WG_PORT="51820"
-
-# Configure WireGuard Interface (wg0)
-uci delete network.wg0 >/dev/null 2>&1
-uci set network.wg0=interface
-uci set network.wg0.proto='wireguard'
-uci set network.wg0.private_key="$WG_SERVER_KEY"
-uci set network.wg0.listen_port="$WG_PORT"
-uci set network.wg0.addresses='10.8.0.1/24'
-uci set network.wg0.mtu='1420'
-
-# Configure Peer (PC Win 10)
-uci add_list network.wg0.wireguard_wg0=wireguard_wg0
-uci set network.@wireguard_wg0[-1].public_key="$WG_CLIENT_PUB"
-uci set network.@wireguard_wg0[-1].allowed_ips='10.8.0.2/32'
-uci set network.@wireguard_wg0[-1].persistent_keep_alive='25'
-
-uci commit network
-
-# ==================== 5. CONFIGURE OPENVPN CLIENT ====================
-mkdir -p /etc/openvpn
-
-cat > /etc/openvpn/us_client.conf <<'EOF'
-# PASTE YOUR US VPN PROVIDER CONFIG HERE LATER
-# Ensure this config does NOT contain conflicting routing directives (e.g., 'redirect-gateway def1')
+# ==================== 2. LAN BRIDGE CONFIG (FOR NGINX PROXY) ====================
+# We ensure the LAN bridge exists and is configured to 192.168.1.1
+uci batch <<EOF
+# LAN IP must be set for uhttpd to bind correctly for Nginx proxying
+set network.lan=interface
+set network.lan.proto='static'
+set network.lan.ipaddr='192.168.1.1'
+set network.lan.netmask='255.255.255.0'
+set network.lan.device='br-lan'
+commit network
 EOF
 
-# Configure OpenVPN Interface (us_vpn)
-uci delete network.us_vpn >/dev/null 2>&1
-uci set network.us_vpn=interface
-uci set network.us_vpn.proto='vpn'
-uci set network.us_vpn.ifname='tun1'
-uci set network.us_vpn.auto='0' # DO NOT AUTO-START
+# ==================== 3. OPENVPN KEY & CERTIFICATES ====================
+mkdir -p /etc/easy-rsa/pki
+if [ ! -f /etc/easy-rsa/pki/ca.crt ]; then
+    easyrsa init-pki 2>/dev/null || true
+    echo | easyrsa build-ca nopass
+    easyrsa gen-dh
+    easyrsa build-server-full server nopass
+    easyrsa build-client-full client nopass
+fi
 
-# Configure OpenVPN Instance
-uci delete openvpn.us_client >/dev/null 2>&1
-uci set openvpn.us_client=openvpn
-uci set openvpn.us_client.enabled='0' # Disabled by default
-uci set openvpn.us_client.config='/etc/openvpn/us_client.conf'
-uci set openvpn.us_client.interface='us_vpn'
+# ==================== 4. OPENVPN SERVER CONFIG ====================
+uci delete openvpn.myvpn_server 2>/dev/null || true
+uci set openvpn.myvpn_server=openvpn
+uci set openvpn.myvpn_server.enabled='1'
+uci set openvpn.myvpn_server.dev='tun0'
+uci set openvpn.myvpn_server.proto='udp'
+uci set openvpn.myvpn_server.port='1194'
+uci set openvpn.myvpn_server.server='10.8.0.0 255.255.255.0'
+uci set openvpn.myvpn_server.cipher='none'
+uci set openvpn.myvpn_server.auth='none'
+uci set openvpn.myvpn_server.keepalive='10 120'
+uci set openvpn.myvpn_server.persist_key='1'
+uci set openvpn.myvpn_server.persist_tun='1'
+uci set openvpn.myvpn_server.user='nobody'
+uci set openvpn.myvpn_server.group='nogroup'
+uci set openvpn.myvpn_server.ca='/etc/easy-rsa/pki/ca.crt'
+uci set openvpn.myvpn_server.cert='/etc/easy-rsa/pki/issued/server.crt'
+uci set openvpn.myvpn_server.key='/etc/easy-rsa/pki/private/server.key'
+uci set openvpn.myvpn_server.dh='/etc/easy-rsa/pki/dh.pem'
+uci add_list openvpn.myvpn_server.push='dhcp-option DNS 10.8.0.1'
+uci add_list openvpn.myvpn_server.push='redirect-gateway def1 bypass-dhcp'
+uci add_list openvpn.myvpn_server.push='block-outside-dns'
 uci commit openvpn
 
-# ==================== 6. LUCI OVER WAN (NGINX REVERSE PROXY) ====================
+
+# ==================== 5. LUCI VIA NGINX PROXY (FIXED NGINX.CONF STRUCTURE) ====================
+# SSL Certs
 mkdir -p /etc/nginx/certs
 openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
     -keyout /etc/nginx/certs/luci.key \
     -out /etc/nginx/certs/luci.crt \
-    -subj "/CN=$IP_ADDR" >/dev/null 2>&1
+    -subj "/CN=$VPS_IP" >/dev/null 2>&1
 
+# NGINX MAIN CONFIG (FIXED STRUCTURE - KHẮC PHỤC LỖI KHÔNG CÓ KHỐI HTTP)
+cat > /etc/nginx/nginx.conf <<EOF
+user root;
+worker_processes auto;
+events {
+    worker_connections 1024;
+}
+http {
+    include mime.types;
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+    include /etc/nginx/conf.d/luci.conf;
+}
+EOF
+
+# Nginx LuCI Proxy CONFIG
 cat > /etc/nginx/conf.d/luci.conf <<EOF
 server {
     listen 80;
     listen 443 ssl;
-    server_name $IP_ADDR;
+    server_name $VPS_IP;
     ssl_certificate /etc/nginx/certs/luci.crt;
     ssl_certificate_key /etc/nginx/certs/luci.key;
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://192.168.1.1:80;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 EOF
 
-# Shift uhttpd to internal port and disable its SSL
-uci set uhttpd.main.listen_http='127.0.0.1:8080'
-uci set uhttpd.main.listen_https='127.0.0.1:8443'
-uci set uhttpd.main.ssl='0'
+# uhttpd config (bind to LAN IP)
+uci set uhttpd.main.listen_http='192.168.1.1:80'
+uci set uhttpd.main.listen_https='192.168.1.1:443'
 uci commit uhttpd
 
-# ==================== 7. FIREWALL (ZONE, FORWARDING, RULES) ====================
-# A. CREATE ZONES AND FORWARDING
-uci delete firewall.wg_out >/dev/null 2>&1
+
+# ==================== 6. FIREWALL: PORTS + ZONES + DNS BLOCK + SPOOF ====================
+# OpenVPN Port Rule
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-OpenVPN'
+uci set firewall.@rule[-1].src='wan'
+uci set firewall.@rule[-1].dest_port='1194'
+uci set firewall.@rule[-1].proto='udp'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+# OpenVPN Zone (tun0)
 uci add firewall zone
-uci set firewall.@zone[-1].name='wg_out'
+uci set firewall.@zone[-1].name='vpn_out'
 uci set firewall.@zone[-1].input='REJECT'
 uci set firewall.@zone[-1].output='ACCEPT'
 uci set firewall.@zone[-1].forward='ACCEPT'
 uci set firewall.@zone[-1].masq='1'
-uci set firewall.@zone[-1].network='wg0'
+uci set firewall.@zone[-1].network='tun0'
 
-uci add firewall zone
-uci set firewall.@zone[-1].name='us_vpn_zone'
-uci set firewall.@zone[-1].input='REJECT'
-uci set firewall.@zone[-1].output='ACCEPT'
-uci set firewall.@zone[-1].forward='ACCEPT'
-uci set firewall.@zone[-1].network='us_vpn' # Interface 'tun1'
-
-# Forwarding: WireGuard (wg_out) to outside (WAN or VPN)
-uci delete firewall.wg_to_wan >/dev/null 2>&1
 uci add firewall forwarding
-uci set firewall.@forwarding[-1].src='wg_out'
+uci set firewall.@forwarding[-1].src='vpn_out'
 uci set firewall.@forwarding[-1].dest='wan'
 
-# B. ACCESS RULES
+# DNS no-leak (Drop all DNS traffic not going to the VPN/Local DNS)
 uci add firewall rule
-uci set firewall.@rule[-1].name='Allow-WireGuard'
-uci set firewall.@rule[-1].src='wan'
-uci set firewall.@rule[-1].dest_port="$WG_PORT"
-uci set firewall.@rule[-1].proto='udp'
-uci set firewall.@rule[-1].target='ACCEPT'
+uci set firewall.@rule[-1].name='Block_DNS_Leak'
+uci set firewall.@rule[-1].src='lan vpn_out'
+uci set firewall.@rule[-1].dest_port='53'
+uci set firewall.@rule[-1].proto='tcp udp'
+uci set firewall.@rule[-1].target='DROP'
 
 uci add firewall rule
-uci set firewall.@rule[-1].name='Allow-LuCI-HTTP'
-uci set firewall.@rule[-1].src='wan'
-uci set firewall.@rule[-1].dest_port='80'
-uci set firewall.@rule[-1].proto='tcp'
-uci set firewall.@rule[-1].target='ACCEPT'
-
-uci add firewall rule
-uci set firewall.@rule[-1].name='Allow-LuCI-HTTPS'
-uci set firewall.@rule[-1].src='wan'
-uci set firewall.@rule[-1].dest_port='443'
-uci set firewall.@rule[-1].proto='tcp'
-uci set firewall.@rule[-1].target='ACCEPT'
-
-# C. DNS POLICY: NO PUBLIC DNS & ANTI-LEAK
-# 1. ALLOW DNS TO VPS (PRIORITY): Allows wg client to use VPS DNS (10.8.0.1)
-uci add firewall rule
-uci set firewall.@rule[-1].name='Allow_DNS_to_VPS'
-uci set firewall.@rule[-1].src='wg_out'
+uci set firewall.@rule[-1].name='Allow_DNS_to_VPN_Server'
+uci set firewall.@rule[-1].src='lan vpn_out'
 uci set firewall.@rule[-1].dest_ip='10.8.0.1'
 uci set firewall.@rule[-1].dest_port='53'
 uci set firewall.@rule[-1].proto='tcp udp'
 uci set firewall.@rule[-1].target='ACCEPT'
 
-# 2. DROP ALL OTHER DNS: Blocks any other DNS query from escaping (leak)
-uci add firewall rule
-uci set firewall.@rule[-1].name='Block_DNS_Leak'
-uci set firewall.@rule[-1].src='wg_out'
-uci set firewall.@rule[-1].dest='!'
-uci set firewall.@rule[-1].dest_port='53'
-uci set firewall.@rule[-1].proto='tcp udp'
-uci set firewall.@rule[-1].target='DROP'
-
-# D. SPOOF TTL (Windows 10 TTL = 128)
-uci add firewall iptables
-uci set firewall.@iptables[-1].name='Spoof_TTL_Win10'
-uci set firewall.@iptables[-1].target='mangle'
-uci set firewall.@iptables[-1].chain='POSTROUTING'
-uci set firewall.@iptables[-1].out_interface='wan us_vpn' 
-uci set firewall.@iptables[-1].extra='-j TTL --ttl-set 128'
+# Spoof Windows TTL (Using firewall.user for direct iptables commands)
+cat > /etc/firewall.user <<EOF
+# Spoof Windows TTL
+iptables -t mangle -A POSTROUTING -o eth0 -j TTL --ttl-set 128
+iptables -t mangle -A POSTROUTING -o tun0 -j TTL --ttl-set 128
+EOF
 
 uci commit firewall
 
-# ==================== 8. FAIL2BAN CONFIGURATION ====================
-# Enable default SSH jail
-uci set fail2ban.default.enabled='1'
-uci set fail2ban.default.bantime='3600'
-uci set fail2ban.default.maxretry='3'
-
-# Configure Nginx/LuCI jail (Assumes nginx log configuration is default)
-uci set fail2ban.luci=jail
-uci set fail2ban.luci.enabled='1'
-uci set fail2ban.luci.port='80,443'
-uci set fail2ban.luci.logpath='/var/log/nginx/access.log'
-uci set fail2ban.luci.filter='nginx-http-auth' # Use appropriate filter
-uci set fail2ban.luci.maxretry='5'
-uci set fail2ban.luci.bantime='3600'
+# ==================== 7. FAIL2BAN BRUTE-FORCE ====================
+uci set fail2ban.@jail[0].enabled='1'
+uci set fail2ban.@jail[0].name='luci'
+uci set fail2ban.@jail[0].port='80,443'
+uci set fail2ban.@jail[0].logtarget='/var/log/fail2ban.log'
+uci set fail2ban.@jail[0].maxretry='5'
+uci set fail2ban.@jail[0].bantime='3600'
 uci commit fail2ban
 
-# ==================== 9. DNSMASQ CONFIGURATION ====================
-# Configure DNSMASQ to listen on wg0 (for 10.8.0.1)
-uci set dhcp.wg0=dhcp
-uci set dhcp.wg0.interface='wg0'
-uci set dhcp.wg0.start='100'
-uci set dhcp.wg0.limit='150'
-uci set dhcp.wg0.leasetime='12h'
-uci add_list dhcp.@dnsmasq[0].interface='wg0'
+# ==================== 8. DNSMASQ: UPSTREAM ====================
+uci set dhcp.@dnsmasq[0].cachesize='0'
 uci commit dhcp
 
-# ==================== 10. CLIENT CONFIG FILE ====================
-cat > /root/wg-client.conf <<EOF
-[Interface]
-PrivateKey = $WG_CLIENT_KEY
-Address = 10.8.0.2/32
-# DNS is 10.8.0.1 (the VPS itself, which uses the Host's DNS)
-DNS = 10.8.0.1
-
-[Peer]
-PublicKey = $WG_SERVER_PUB
-Endpoint = $IP_ADDR:$WG_PORT
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
+# ==================== 9. FILE CLIENT.OPVN ====================
+cat > /root/client.ovpn <<EOF
+client
+dev tun
+proto udp
+remote $VPS_IP 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+cipher none
+auth none
+remote-cert-tls server
+block-outside-dns
+verb 3
+<ca>
+$(cat /etc/easy-rsa/pki/ca.crt)
+</ca>
+<cert>
+$(cat /etc/easy-rsa/pki/issued/client.crt)
+</cert>
+<key>
+$(cat /etc/easy-rsa/pki/private/client.key)
+</key>
 EOF
 
-# ==================== 11. START SERVICES ====================
+# ==================== 10. End: Restart Services ====================
 /etc/init.d/network restart
 /etc/init.d/uhttpd restart
 /etc/init.d/nginx enable
 /etc/init.d/nginx restart
+/etc/init.d/openvpn restart
 /etc/init.d/firewall restart
 /etc/init.d/dnsmasq restart
 /etc/init.d/fail2ban enable
 /etc/init.d/fail2ban start
 
+# Final Output
 echo "=============================================="
-echo "SETUP COMPLETE!"
-echo "LuCI Web Interface: https://$IP_ADDR"
-echo "WireGuard Client Config File: /root/wg-client.conf"
-echo "Next Steps:"
-echo "1. Paste US OpenVPN config into /etc/openvpn/us_client.conf."
-echo "2. Go to LuCI -> VPN -> OpenVPN -> us_client -> Enable to activate the VPN."
+echo "FULL SETUP SUCCESSFUL!"
+echo "VPS IP: $VPS_IP"
+echo ""
+echo "1. LUCI ACCESS: http://$VPS_IP or https://$VPS_IP"
+echo "   User: root | Password: [Your Console Password]"
+echo ""
+echo "2. OPENVPN CLIENT FILE: /root/client.ovpn (Download this file)"
 echo "=============================================="
