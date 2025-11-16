@@ -1,13 +1,13 @@
 #!/bin/sh
 # =============================================================================
-# OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4
-# Enhanced DNS+NAT for Road Warrior, inspired by AntidetectRouter.sh (@vektort13)
+# OPENVPN SETUP
+# Enhanced DNS+NAT
 # =============================================================================
 
 set -e
 
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║    OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4    ║"
+echo "║    OPENVPN SETUP - PATCHED FOR OpenWrt 24.10.4    ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
 
