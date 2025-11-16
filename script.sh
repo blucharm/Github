@@ -1,19 +1,14 @@
 #!/bin/sh
 # =============================================================================
-# OPENVPN VPS SETUP - FINAL WORKING VERSION
-# All bugs fixed, tested and working perfectly
-# - OpenVPN Server (tun1) for Windows clients
-# - Direct uhttpd access (no Nginx proxy issues)
-# - NAT with nftables fw4
-# - DNS optimized (no slow loading)
-# - TTL spoofing, optimized for 1-2 core / 1GB RAM
+# OPENVPN SETUP - FINAL WORKING VERSION
 # =============================================================================
+
 
 set -e
 
 # ==================== AUTO-DETECT CONFIGURATION ====================
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║    OPENVPN VPS SETUP - FINAL WORKING VERSION          ║"
+echo "║    OPENVPN  SETUP - FINAL WORKING VERSION              ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
 
