@@ -1,8 +1,8 @@
 #!/bin/bash
 
 ###############################################################################
-# OpenWRT VPS Auto Setup Script for Vultr
-# Features: OpenVPN Server + VPC Network + Passwall Ready
+# Auto Setup Script
+# OpenVPN
 ###############################################################################
 
 set -e  # Exit on error
