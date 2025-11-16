@@ -1,15 +1,13 @@
 #!/bin/sh
 # =============================================================================
-# OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4 (AUTO-FIX WAN MAPPING + NFT RULES)
-# - Auto-detect WAN interface from routing table and ensure UCI network.wan.device
-# - Clean/replace /etc/firewall.user with idempotent rules using detected WAN iface
-# - Add nft/iptables NAT & forwarding rules for VPN subnet
+# OPENVPN SETUP
 # =============================================================================
+
 
 set -e
 
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║    OPENVPN VPS SETUP - PATCHED FOR OpenWrt 24.10.4    ║"
+echo "║    OPENVPN SETUP - PATCHED FOR OpenWrt 24.10.4         ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
 
